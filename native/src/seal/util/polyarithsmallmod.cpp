@@ -9,6 +9,10 @@
 #include "hexl/hexl.hpp"
 #endif
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 using namespace std;
 
 namespace seal
@@ -66,6 +70,43 @@ namespace seal
 
 #ifdef SEAL_USE_INTEL_HEXL
             intel::hexl::EltwiseAddMod(&result[0], &operand1[0], &operand2[0], coeff_count, modulus_value);
+#elif defined(__aarch64__)
+            {
+                const uint64_t *op1 = &operand1[0];
+                const uint64_t *op2 = &operand2[0];
+                uint64_t *res = &result[0];
+                const uint64x2_t mod_vec = vdupq_n_u64(modulus_value);
+                size_t i = 0;
+                for (; i + 8 <= coeff_count; i += 8)
+                {
+                    uint64x2_t a0 = vld1q_u64(op1 + i);
+                    uint64x2_t a1 = vld1q_u64(op1 + i + 2);
+                    uint64x2_t a2 = vld1q_u64(op1 + i + 4);
+                    uint64x2_t a3 = vld1q_u64(op1 + i + 6);
+                    uint64x2_t b0 = vld1q_u64(op2 + i);
+                    uint64x2_t b1 = vld1q_u64(op2 + i + 2);
+                    uint64x2_t b2 = vld1q_u64(op2 + i + 4);
+                    uint64x2_t b3 = vld1q_u64(op2 + i + 6);
+                    uint64x2_t s0 = vaddq_u64(a0, b0);
+                    uint64x2_t s1 = vaddq_u64(a1, b1);
+                    uint64x2_t s2 = vaddq_u64(a2, b2);
+                    uint64x2_t s3 = vaddq_u64(a3, b3);
+                    // Conditional subtract: if sum >= modulus, subtract modulus
+                    uint64x2_t m0 = vcgeq_u64(s0, mod_vec);
+                    uint64x2_t m1 = vcgeq_u64(s1, mod_vec);
+                    uint64x2_t m2 = vcgeq_u64(s2, mod_vec);
+                    uint64x2_t m3 = vcgeq_u64(s3, mod_vec);
+                    vst1q_u64(res + i,     vsubq_u64(s0, vandq_u64(m0, mod_vec)));
+                    vst1q_u64(res + i + 2, vsubq_u64(s1, vandq_u64(m1, mod_vec)));
+                    vst1q_u64(res + i + 4, vsubq_u64(s2, vandq_u64(m2, mod_vec)));
+                    vst1q_u64(res + i + 6, vsubq_u64(s3, vandq_u64(m3, mod_vec)));
+                }
+                for (; i < coeff_count; i++)
+                {
+                    uint64_t sum = op1[i] + op2[i];
+                    res[i] = SEAL_COND_SELECT(sum >= modulus_value, sum - modulus_value, sum);
+                }
+            }
 #else
 
             SEAL_ITERATE(iter(operand1, operand2, result), coeff_count, [&](auto I) {
@@ -111,6 +152,44 @@ namespace seal
             const uint64_t modulus_value = modulus.value();
 #ifdef SEAL_USE_INTEL_HEXL
             intel::hexl::EltwiseSubMod(result, operand1, operand2, coeff_count, modulus_value);
+#elif defined(__aarch64__)
+            {
+                const uint64_t *op1 = &operand1[0];
+                const uint64_t *op2 = &operand2[0];
+                uint64_t *res = &result[0];
+                const uint64x2_t mod_vec = vdupq_n_u64(modulus_value);
+                size_t i = 0;
+                for (; i + 8 <= coeff_count; i += 8)
+                {
+                    uint64x2_t a0 = vld1q_u64(op1 + i);
+                    uint64x2_t a1 = vld1q_u64(op1 + i + 2);
+                    uint64x2_t a2 = vld1q_u64(op1 + i + 4);
+                    uint64x2_t a3 = vld1q_u64(op1 + i + 6);
+                    uint64x2_t b0 = vld1q_u64(op2 + i);
+                    uint64x2_t b1 = vld1q_u64(op2 + i + 2);
+                    uint64x2_t b2 = vld1q_u64(op2 + i + 4);
+                    uint64x2_t b3 = vld1q_u64(op2 + i + 6);
+                    // Compute diff = a - b; if a < b (borrow), add modulus
+                    uint64x2_t borrow0 = vcltq_u64(a0, b0);
+                    uint64x2_t borrow1 = vcltq_u64(a1, b1);
+                    uint64x2_t borrow2 = vcltq_u64(a2, b2);
+                    uint64x2_t borrow3 = vcltq_u64(a3, b3);
+                    uint64x2_t d0 = vaddq_u64(vsubq_u64(a0, b0), vandq_u64(borrow0, mod_vec));
+                    uint64x2_t d1 = vaddq_u64(vsubq_u64(a1, b1), vandq_u64(borrow1, mod_vec));
+                    uint64x2_t d2 = vaddq_u64(vsubq_u64(a2, b2), vandq_u64(borrow2, mod_vec));
+                    uint64x2_t d3 = vaddq_u64(vsubq_u64(a3, b3), vandq_u64(borrow3, mod_vec));
+                    vst1q_u64(res + i,     d0);
+                    vst1q_u64(res + i + 2, d1);
+                    vst1q_u64(res + i + 4, d2);
+                    vst1q_u64(res + i + 6, d3);
+                }
+                for (; i < coeff_count; i++)
+                {
+                    unsigned long long temp_result;
+                    std::int64_t borrow = sub_uint64(op1[i], op2[i], &temp_result);
+                    res[i] = temp_result + (modulus_value & static_cast<std::uint64_t>(-borrow));
+                }
+            }
 #else
             SEAL_ITERATE(iter(operand1, operand2, result), coeff_count, [&](auto I) {
 #ifdef SEAL_DEBUG

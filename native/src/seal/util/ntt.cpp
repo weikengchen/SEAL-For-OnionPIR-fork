@@ -5,6 +5,9 @@
 #include "seal/util/uintarith.h"
 #include "seal/util/uintarithsmallmod.h"
 #include <algorithm>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef SEAL_USE_INTEL_HEXL
 #include "seal/memorymanager.h"
 #include "seal/util/iterator.h"
@@ -422,6 +425,48 @@ namespace seal
             std::uint64_t two_times_modulus = modulus * 2;
             std::size_t n = std::size_t(1) << tables.coeff_count_power();
 
+#if defined(__aarch64__)
+            {
+                uint64_t *data = operand.ptr();
+                uint64x2_t mod_vec = vdupq_n_u64(modulus);
+                uint64x2_t two_mod_vec = vdupq_n_u64(two_times_modulus);
+                size_t i = 0;
+                for (; i + 8 <= n; i += 8)
+                {
+                    uint64x2_t v0 = vld1q_u64(data + i);
+                    uint64x2_t v1 = vld1q_u64(data + i + 2);
+                    uint64x2_t v2 = vld1q_u64(data + i + 4);
+                    uint64x2_t v3 = vld1q_u64(data + i + 6);
+                    // Subtract 2*modulus if >= 2*modulus
+                    uint64x2_t m0 = vcgeq_u64(v0, two_mod_vec);
+                    uint64x2_t m1 = vcgeq_u64(v1, two_mod_vec);
+                    uint64x2_t m2 = vcgeq_u64(v2, two_mod_vec);
+                    uint64x2_t m3 = vcgeq_u64(v3, two_mod_vec);
+                    v0 = vsubq_u64(v0, vandq_u64(m0, two_mod_vec));
+                    v1 = vsubq_u64(v1, vandq_u64(m1, two_mod_vec));
+                    v2 = vsubq_u64(v2, vandq_u64(m2, two_mod_vec));
+                    v3 = vsubq_u64(v3, vandq_u64(m3, two_mod_vec));
+                    // Subtract modulus if >= modulus
+                    m0 = vcgeq_u64(v0, mod_vec);
+                    m1 = vcgeq_u64(v1, mod_vec);
+                    m2 = vcgeq_u64(v2, mod_vec);
+                    m3 = vcgeq_u64(v3, mod_vec);
+                    v0 = vsubq_u64(v0, vandq_u64(m0, mod_vec));
+                    v1 = vsubq_u64(v1, vandq_u64(m1, mod_vec));
+                    v2 = vsubq_u64(v2, vandq_u64(m2, mod_vec));
+                    v3 = vsubq_u64(v3, vandq_u64(m3, mod_vec));
+                    vst1q_u64(data + i, v0);
+                    vst1q_u64(data + i + 2, v1);
+                    vst1q_u64(data + i + 4, v2);
+                    vst1q_u64(data + i + 6, v3);
+                }
+                for (; i < n; i++)
+                {
+                    if (data[i] >= two_times_modulus) data[i] -= two_times_modulus;
+                    if (data[i] >= modulus) data[i] -= modulus;
+                }
+            }
+#else
             SEAL_ITERATE(operand, n, [&](auto &I) {
                 // Note: I must be passed to the lambda by reference.
                 if (I >= two_times_modulus)
@@ -433,6 +478,7 @@ namespace seal
                     I -= modulus;
                 }
             });
+#endif
 #endif
         }
 
@@ -464,6 +510,32 @@ namespace seal
 
             // Final adjustments; compute a[j] = a[j] * n^{-1} mod q.
             // We incorporated the final adjustment in the butterfly. Only need to reduce here.
+#if defined(__aarch64__)
+            {
+                uint64_t *data = operand.ptr();
+                uint64x2_t mod_vec = vdupq_n_u64(modulus);
+                size_t i = 0;
+                for (; i + 8 <= n; i += 8)
+                {
+                    uint64x2_t v0 = vld1q_u64(data + i);
+                    uint64x2_t v1 = vld1q_u64(data + i + 2);
+                    uint64x2_t v2 = vld1q_u64(data + i + 4);
+                    uint64x2_t v3 = vld1q_u64(data + i + 6);
+                    uint64x2_t m0 = vcgeq_u64(v0, mod_vec);
+                    uint64x2_t m1 = vcgeq_u64(v1, mod_vec);
+                    uint64x2_t m2 = vcgeq_u64(v2, mod_vec);
+                    uint64x2_t m3 = vcgeq_u64(v3, mod_vec);
+                    vst1q_u64(data + i,     vsubq_u64(v0, vandq_u64(m0, mod_vec)));
+                    vst1q_u64(data + i + 2, vsubq_u64(v1, vandq_u64(m1, mod_vec)));
+                    vst1q_u64(data + i + 4, vsubq_u64(v2, vandq_u64(m2, mod_vec)));
+                    vst1q_u64(data + i + 6, vsubq_u64(v3, vandq_u64(m3, mod_vec)));
+                }
+                for (; i < n; i++)
+                {
+                    if (data[i] >= modulus) data[i] -= modulus;
+                }
+            }
+#else
             SEAL_ITERATE(operand, n, [&](auto &I) {
                 // Note: I must be passed to the lambda by reference.
                 if (I >= modulus)
@@ -471,6 +543,7 @@ namespace seal
                     I -= modulus;
                 }
             });
+#endif
 #endif
         }
     } // namespace util
